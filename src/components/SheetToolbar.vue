@@ -5,6 +5,10 @@ import { columnLabel } from '../utils/cells'
 
 const store = useSheetStore()
 const activeLabel = computed(() => `${columnLabel(store.active.col)}${store.active.row + 1}`)
+
+function openInNewTab() {
+  window.open(window.location.href, '_blank')
+}
 </script>
 
 <template>
@@ -34,8 +38,19 @@ const activeLabel = computed(() => `${columnLabel(store.active.col)}${store.acti
       <v-btn size="small" variant="text" prepend-icon="mdi-delete-outline" @click="store.clearSelection">清除内容</v-btn>
     </div>
     <div class="toolbar-right">
+      <span class="session-badge" title="会话号 / 当前版本">
+        <v-icon size="12" icon="mdi-account" />{{ store.sessionShort }} · v{{ store.version }}
+      </span>
+      <span v-if="store.recalcBusy" class="recalc-hint">
+        <v-icon size="12" icon="mdi-loading mdi-spin" />重算中
+      </span>
       <span class="active-badge">{{ activeLabel }}</span>
       <span class="muted">{{ store.status }}</span>
+      <v-btn size="small" variant="text" prepend-icon="mdi-open-in-new" @click="openInNewTab">新标签页</v-btn>
+      <v-btn size="small" variant="text" prepend-icon="mdi-source-branch-sync" @click="store.showSyncPanel = !store.showSyncPanel">
+        协作
+        <v-badge v-if="store.conflicts.length" color="error" :content="store.conflicts.length" inline />
+      </v-btn>
       <v-btn size="small" variant="text" prepend-icon="mdi-refresh" @click="store.reset">重置</v-btn>
       <v-btn size="small" color="primary" variant="flat" prepend-icon="mdi-download" @click="store.exportCsv">导出 CSV</v-btn>
     </div>
@@ -55,5 +70,7 @@ const activeLabel = computed(() => `${columnLabel(store.active.col)}${store.acti
 }
 .toolbar-left, .toolbar-right { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .active-badge { padding: 4px 8px; border-radius: 5px; color: #1d4ed8; background: #eaf2ff; font: 700 12px ui-monospace, monospace; }
+.session-badge { display: inline-flex; align-items: center; gap: 3px; padding: 4px 8px; border-radius: 5px; color: #0f766e; background: #ecfdf5; font: 700 11px ui-monospace, monospace; white-space: nowrap; }
+.recalc-hint { display: inline-flex; align-items: center; gap: 3px; color: #b45309; font-size: 11px; white-space: nowrap; }
 .muted { color: #718096; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
 </style>

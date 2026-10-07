@@ -201,7 +201,7 @@ onUnmounted(() => {
         v-for="col in frozenCols"
         :key="`fc-${row}-${col}`"
         class="cell frozen-cell"
-        :class="{ selected: store.isSelected(row, col), active: store.active.row === row && store.active.col === col }"
+        :class="{ selected: store.isSelected(row, col), active: store.active.row === row && store.active.col === col, conflicted: store.isConflicted(row, col) }"
         :style="{ left: `${xForCol(col)}px`, top: `${yForRow(row)}px`, width: `${CELL_W}px`, height: `${CELL_H}px` }"
         @mousedown="selectCell(row, col, $event)"
         @dblclick="startEdit(row, col)"
@@ -215,7 +215,7 @@ onUnmounted(() => {
         v-for="col in frozenCols"
         :key="`vrf-${row}-${col}`"
         class="cell frozen-cell"
-        :class="{ selected: store.isSelected(row, col), active: store.active.row === row && store.active.col === col }"
+        :class="{ selected: store.isSelected(row, col), active: store.active.row === row && store.active.col === col, conflicted: store.isConflicted(row, col) }"
         :style="{ left: `${xForCol(col)}px`, top: `${yForRow(row)}px`, width: `${CELL_W}px`, height: `${CELL_H}px` }"
         @mousedown="selectCell(row, col, $event)"
         @mouseenter="enterCell(row, col)"
@@ -240,7 +240,7 @@ onUnmounted(() => {
         v-for="col in visibleCols"
         :key="`cell-${row}-${col}`"
         class="cell"
-        :class="{ selected: store.isSelected(row, col), active: store.active.row === row && store.active.col === col }"
+        :class="{ selected: store.isSelected(row, col), active: store.active.row === row && store.active.col === col, conflicted: store.isConflicted(row, col) }"
         :style="{ left: `${xForCol(col)}px`, top: `${yForRow(row)}px`, width: `${CELL_W}px`, height: `${CELL_H}px` }"
         @mousedown="selectCell(row, col, $event)"
         @mouseenter="enterCell(row, col)"
@@ -322,6 +322,16 @@ onUnmounted(() => {
 .cell:hover { background: #f8fbff; }
 .cell.selected { background: rgba(59, 130, 246, .09); }
 .cell.active { z-index: 4; outline: 2px solid #2563eb; outline-offset: -2px; background: #fff; }
+.cell.conflicted { background: #fff7ed; box-shadow: inset 0 0 0 2px #f59e0b; }
+.cell.conflicted::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  border-style: solid;
+  border-width: 0 9px 9px 0;
+  border-color: transparent #f59e0b transparent transparent;
+}
 .cell.frozen-cell { z-index: 5; box-shadow: 2px 0 5px rgba(30, 45, 65, .04); }
 .cell-value { width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .cell-value.error { color: #dc2626; font-family: ui-monospace, monospace; font-size: 11px; }

@@ -3,6 +3,8 @@ export type CellValue = string | number | boolean | null
 export interface CellRecord {
   raw: string
   value: CellValue
+  /** 最近一次重算成功的值；重算失败时回落到它 */
+  lastValidValue?: CellValue
   error?: string
 }
 
