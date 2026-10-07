@@ -4,6 +4,10 @@ export interface CellRecord {
   raw: string
   value: CellValue
   error?: string
+  /** 重算失败后保留的上次有效值（公式链暂不可用） */
+  stale?: boolean
+  /** 同格多版待选 */
+  conflict?: boolean
 }
 
 export interface CellCoord {

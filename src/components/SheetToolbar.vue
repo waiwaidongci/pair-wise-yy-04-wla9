@@ -5,6 +5,7 @@ import { columnLabel } from '../utils/cells'
 
 const store = useSheetStore()
 const activeLabel = computed(() => `${columnLabel(store.active.col)}${store.active.row + 1}`)
+const conflictCount = computed(() => store.conflicts.length)
 </script>
 
 <template>
@@ -36,6 +37,16 @@ const activeLabel = computed(() => `${columnLabel(store.active.col)}${store.acti
     <div class="toolbar-right">
       <span class="active-badge">{{ activeLabel }}</span>
       <span class="muted">{{ store.status }}</span>
+      <v-btn size="small" variant="text" prepend-icon="mdi-source-branch" @click="store.toggleRevisionPanel">
+        修订
+        <v-badge
+          v-if="conflictCount"
+          :content="conflictCount"
+          color="red"
+          inline
+          class="conflict-badge"
+        />
+      </v-btn>
       <v-btn size="small" variant="text" prepend-icon="mdi-refresh" @click="store.reset">重置</v-btn>
       <v-btn size="small" color="primary" variant="flat" prepend-icon="mdi-download" @click="store.exportCsv">导出 CSV</v-btn>
     </div>
@@ -56,4 +67,5 @@ const activeLabel = computed(() => `${columnLabel(store.active.col)}${store.acti
 .toolbar-left, .toolbar-right { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .active-badge { padding: 4px 8px; border-radius: 5px; color: #1d4ed8; background: #eaf2ff; font: 700 12px ui-monospace, monospace; }
 .muted { color: #718096; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
+.conflict-badge { margin-left: 4px; }
 </style>

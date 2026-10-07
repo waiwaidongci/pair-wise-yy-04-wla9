@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useSheetStore } from '../stores/sheet'
-import { columnLabel } from '../utils/cells'
+import { cellId, columnLabel, displayValue } from '../utils/cells'
 
 const store = useSheetStore()
 const draft = ref('')
 const cellLabel = computed(() => `${columnLabel(store.active.col)}${store.active.row + 1}`)
+const activeRecord = computed(() => store.getRecord(store.active.row, store.active.col))
+const activeFlags = computed(() => store.getCellFlags(cellId(store.active.row, store.active.col)))
 
 watch(() => store.activeRaw, (value) => { draft.value = value }, { immediate: true })
 
@@ -25,9 +27,11 @@ function commit() {
       @keydown.enter.prevent="commit"
       @blur="draft !== store.activeRaw && commit()"
     />
-    <span v-if="store.getRecord(store.active.row, store.active.col)?.error" class="formula-error">
-      {{ store.getRecord(store.active.row, store.active.col)?.error }}
+    <span v-if="activeFlags.conflict" class="formula-hint conflict">同格两版待选（见修订记录面板）</span>
+    <span v-else-if="activeFlags.stale" class="formula-hint stale">
+      公式暂不可用（{{ activeRecord?.error }}），已保留上次有效值 {{ displayValue(activeRecord?.value) }}
     </span>
+    <span v-else-if="activeRecord?.error" class="formula-error">{{ activeRecord.error }}</span>
   </div>
 </template>
 
@@ -38,4 +42,7 @@ function commit() {
 .formula-input { flex: 1; min-width: 0; height: 28px; padding: 0 8px; border: 1px solid #d8e0ea; border-radius: 4px; outline: none; color: #1e293b; font: 12px ui-monospace, monospace; }
 .formula-input:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,.12); }
 .formula-error { color: #dc2626; font-size: 11px; font-weight: 700; }
+.formula-hint { font-size: 11px; font-weight: 600; white-space: nowrap; }
+.formula-hint.conflict { color: #b91c1c; }
+.formula-hint.stale { color: #b45309; }
 </style>

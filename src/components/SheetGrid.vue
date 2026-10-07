@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useSheetStore } from '../stores/sheet'
-import { columnLabel, displayValue, normalizeRange } from '../utils/cells'
+import { columnLabel, cellId, displayValue, normalizeRange } from '../utils/cells'
 
 const store = useSheetStore()
 const viewport = ref<HTMLElement | null>(null)
@@ -36,6 +36,25 @@ const visibleCols = computed(() => {
 })
 const frozenRows = computed(() => Array.from({ length: store.freezeRows }, (_, index) => index))
 const frozenCols = computed(() => Array.from({ length: store.freezeCols }, (_, index) => index))
+
+function cellRecord(row: number, col: number) {
+  return store.getRecord(row, col)
+}
+
+function cellFlags(row: number, col: number) {
+  return store.getCellFlags(cellId(row, col))
+}
+
+function cellTitle(row: number, col: number): string {
+  const record = cellRecord(row, col)
+  const flags = cellFlags(row, col)
+  const parts: string[] = []
+  if (flags.conflict) parts.push('同格两版待选')
+  if (flags.stale) parts.push(`公式暂不可用（${record?.error ?? '#ERROR!'}），已保留上次有效值`)
+  else if (record?.error) parts.push(record.error)
+  if (flags.dirty) parts.push('待重算')
+  return parts.join(' · ')
+}
 
 function xForCol(col: number) {
   if (col < store.freezeCols) return HEADER_W + col * CELL_W
@@ -201,12 +220,13 @@ onUnmounted(() => {
         v-for="col in frozenCols"
         :key="`fc-${row}-${col}`"
         class="cell frozen-cell"
-        :class="{ selected: store.isSelected(row, col), active: store.active.row === row && store.active.col === col }"
+        :class="{ selected: store.isSelected(row, col), active: store.active.row === row && store.active.col === col, 'cell-conflict': cellFlags(row, col).conflict, 'cell-stale': cellFlags(row, col).stale, 'cell-dirty': cellFlags(row, col).dirty }"
         :style="{ left: `${xForCol(col)}px`, top: `${yForRow(row)}px`, width: `${CELL_W}px`, height: `${CELL_H}px` }"
+        :title="cellTitle(row, col)"
         @mousedown="selectCell(row, col, $event)"
         @dblclick="startEdit(row, col)"
       >
-        <span class="cell-value">{{ store.getRecord(row, col)?.error || displayValue(store.getRecord(row, col)?.value) }}</span>
+        <span class="cell-value">{{ displayValue(cellRecord(row, col)?.value) }}</span>
       </div>
     </template>
 
@@ -215,8 +235,9 @@ onUnmounted(() => {
         v-for="col in frozenCols"
         :key="`vrf-${row}-${col}`"
         class="cell frozen-cell"
-        :class="{ selected: store.isSelected(row, col), active: store.active.row === row && store.active.col === col }"
+        :class="{ selected: store.isSelected(row, col), active: store.active.row === row && store.active.col === col, 'cell-conflict': cellFlags(row, col).conflict, 'cell-stale': cellFlags(row, col).stale, 'cell-dirty': cellFlags(row, col).dirty }"
         :style="{ left: `${xForCol(col)}px`, top: `${yForRow(row)}px`, width: `${CELL_W}px`, height: `${CELL_H}px` }"
+        :title="cellTitle(row, col)"
         @mousedown="selectCell(row, col, $event)"
         @mouseenter="enterCell(row, col)"
         @dblclick="startEdit(row, col)"
@@ -229,8 +250,8 @@ onUnmounted(() => {
           @keydown.enter.prevent="commitEdit(); move(1, 0)"
           @keydown.escape.prevent="cancelEdit"
         />
-        <span v-else class="cell-value" :class="{ error: store.getRecord(row, col)?.error }">
-          {{ store.getRecord(row, col)?.error || displayValue(store.getRecord(row, col)?.value) }}
+        <span v-else class="cell-value" :class="{ 'value-error': cellRecord(row, col)?.error && !cellFlags(row, col).stale }">
+          {{ displayValue(cellRecord(row, col)?.value) }}
         </span>
       </div>
     </template>
@@ -240,8 +261,9 @@ onUnmounted(() => {
         v-for="col in visibleCols"
         :key="`cell-${row}-${col}`"
         class="cell"
-        :class="{ selected: store.isSelected(row, col), active: store.active.row === row && store.active.col === col }"
+        :class="{ selected: store.isSelected(row, col), active: store.active.row === row && store.active.col === col, 'cell-conflict': cellFlags(row, col).conflict, 'cell-stale': cellFlags(row, col).stale, 'cell-dirty': cellFlags(row, col).dirty }"
         :style="{ left: `${xForCol(col)}px`, top: `${yForRow(row)}px`, width: `${CELL_W}px`, height: `${CELL_H}px` }"
+        :title="cellTitle(row, col)"
         @mousedown="selectCell(row, col, $event)"
         @mouseenter="enterCell(row, col)"
         @dblclick="startEdit(row, col)"
@@ -254,8 +276,8 @@ onUnmounted(() => {
           @keydown.enter.prevent="commitEdit(); move(1, 0)"
           @keydown.escape.prevent="cancelEdit"
         />
-        <span v-else class="cell-value" :class="{ error: store.getRecord(row, col)?.error }">
-          {{ store.getRecord(row, col)?.error || displayValue(store.getRecord(row, col)?.value) }}
+        <span v-else class="cell-value" :class="{ 'value-error': cellRecord(row, col)?.error && !cellFlags(row, col).stale }">
+          {{ displayValue(cellRecord(row, col)?.value) }}
         </span>
       </div>
     </template>
@@ -324,7 +346,39 @@ onUnmounted(() => {
 .cell.active { z-index: 4; outline: 2px solid #2563eb; outline-offset: -2px; background: #fff; }
 .cell.frozen-cell { z-index: 5; box-shadow: 2px 0 5px rgba(30, 45, 65, .04); }
 .cell-value { width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.cell-value.error { color: #dc2626; font-family: ui-monospace, monospace; font-size: 11px; }
+.cell-value.value-error { color: #dc2626; font-family: ui-monospace, monospace; font-size: 11px; }
+.cell.cell-conflict { background: #fef2f2; }
+.cell.cell-conflict::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #dc2626;
+  box-shadow: 0 0 0 1.5px #fff;
+}
+.cell.cell-stale::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #f59e0b;
+  box-shadow: 0 0 0 1.5px #fff;
+}
+.cell.cell-dirty::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: #93c5fd;
+}
 .cell-editor {
   width: calc(100% + 14px);
   height: 100%;

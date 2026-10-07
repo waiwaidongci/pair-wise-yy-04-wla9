@@ -1,11 +1,27 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import type { CellCoord, CellMap, CellRange, CellRecord, CellValue } from '../types/sheet'
-import { cellId, displayValue, literalValue, normalizeRange, rangeContains } from '../utils/cells'
+import type { CellConflict, CellOp, CellVersion, SessionId, VersionVector } from '../types/revision'
+import { cellId, columnIndex, displayValue, literalValue, normalizeRange, rangeContains } from '../utils/cells'
 import { FormulaError, evaluateAst, formulaDependencies, parseFormula } from '../utils/formula'
+import {
+  applyOp,
+  clearAllSessionOps,
+  cloneVV,
+  conflictsOf,
+  createSessionId,
+  displayVersion,
+  emptyVV,
+  loadAllSessionOps,
+  makeOp,
+  replayOps,
+  saveSessionOps,
+  vvEqual,
+} from '../utils/revision'
 
 const ROWS = 1000
 const COLS = 26
+const CHANNEL_NAME = 'gridformula-revision'
 
 function createStarterCells(): CellMap {
   const cells: CellMap = {}
@@ -54,10 +70,9 @@ function createStarterCells(): CellMap {
   return cells
 }
 
-interface HistorySnapshot {
-  cells: CellMap
-  active: CellCoord
-  selection: CellRange
+interface UndoEntry {
+  undo: Array<{ cellId: string; raw: string }>
+  redo: Array<{ cellId: string; raw: string }>
 }
 
 export const useSheetStore = defineStore('sheet', () => {
@@ -69,14 +84,34 @@ export const useSheetStore = defineStore('sheet', () => {
   const freezeRows = ref(1)
   const freezeCols = ref(1)
   const lastRecalculated = ref<string[]>([])
-  const history = ref<HistorySnapshot[]>([])
-  const future = ref<HistorySnapshot[]>([])
   const status = ref('工作簿已加载，公式引擎待命')
+
+  // ---- 修订记录 ----
+  const sessionId = ref<SessionId>('')
+  const baseVV = ref<VersionVector>(emptyVV())
+  const vv = ref<VersionVector>(emptyVV())
+  const heads = ref<Map<string, CellVersion[]>>(new Map())
+  const conflicts = ref<CellConflict[]>([])
+  const opLog = ref<CellOp[]>([])
+  const undoStack = ref<UndoEntry[]>([])
+  const redoStack = ref<UndoEntry[]>([])
+
+  // ---- 公式重算（批次围栏 + 重试 + 上次有效值）----
+  const recalcGeneration = ref(0)
+  const dirtyCells = ref<Set<string>>(new Set())
+  const recalcState = ref<'idle' | 'running' | 'retrying' | 'failed'>('idle')
+  const lastGood = ref<Map<string, CellValue>>(new Map())
+  let recalcLoopRunning = false
+
+  // ---- UI ----
+  const revisionPanelOpen = ref(false)
 
   const activeRaw = computed(() => getRaw(active.value.row, active.value.col))
   const activeValue = computed(() => cells.value[cellId(active.value.row, active.value.col)]?.value ?? null)
-  const canUndo = computed(() => history.value.length > 0)
-  const canRedo = computed(() => future.value.length > 0)
+  const canUndo = computed(() => undoStack.value.length > 0)
+  const canRedo = computed(() => redoStack.value.length > 0)
+  const localSeq = computed(() => vv.value[sessionId.value] ?? 0)
+  const dirtyCount = computed(() => dirtyCells.value.size)
 
   function idFor(row: number, col: number) {
     return cellId(row, col)
@@ -116,91 +151,87 @@ export const useSheetStore = defineStore('sheet', () => {
     return affected
   }
 
-  function recalculate(ids: Set<string>) {
-    const resolved = new Map<string, CellValue>()
-    const failedCycles = new Set<string>()
+  // ---- 修订操作 ----
 
-    const resolve = (id: string, stack: string[]): CellValue => {
-      if (resolved.has(id)) return resolved.get(id) ?? null
-      if (stack.includes(id)) {
-        stack.forEach((item) => failedCycles.add(item))
-        throw new FormulaError('#CYCLE!')
-      }
-      const record = cells.value[id]
-      if (!record) return null
-      if (!record.raw.startsWith('=')) {
-        const value = literalValue(record.raw)
-        resolved.set(id, value)
-        return value
-      }
-      const ast = parseFormula(record.raw)
-      const nextStack = [...stack, id]
-      const value = evaluateAst(
-        ast,
-        (reference) => resolve(reference, nextStack),
-        (range) => {
-          const [start, end] = range.split(':')
-          const startCoord = cells.value[start] ? start : start
-          const endCoord = cells.value[end] ? end : end
-          const idsInRange: string[] = []
-          const startMatch = /^([A-Z]+)(\d+)$/i.exec(startCoord)
-          const endMatch = /^([A-Z]+)(\d+)$/i.exec(endCoord)
-          if (startMatch && endMatch) {
-            const startCol = startMatch[1].toUpperCase().split('').reduce((sum, char) => sum * 26 + char.charCodeAt(0) - 64, 0) - 1
-            const endCol = endMatch[1].toUpperCase().split('').reduce((sum, char) => sum * 26 + char.charCodeAt(0) - 64, 0) - 1
-            for (let row = Number(startMatch[2]) - 1; row <= Number(endMatch[2]) - 1; row += 1) {
-              for (let col = startCol; col <= endCol; col += 1) idsInRange.push(cellId(row, col))
-            }
-          }
-          return idsInRange.map((cell) => resolve(cell, nextStack))
-        },
-      ) as CellValue
-      resolved.set(id, value)
-      return value
-    }
-
-    ids.forEach((id) => {
-      try {
-        const value = resolve(id, [])
-        const record = cells.value[id]
-        if (record) cells.value[id] = { ...record, value, error: undefined }
-      } catch (error) {
-        const record = cells.value[id]
-        if (record) {
-          const code = error instanceof FormulaError ? error.code : '#ERROR!'
-          cells.value[id] = { ...record, value: null, error: failedCycles.has(id) ? '#CYCLE!' : code }
-        }
-      }
-    })
-    lastRecalculated.value = [...ids]
-    status.value = `已重算 ${ids.size} 个受影响单元格`
+  function persistSessionOps() {
+    const own = opLog.value.filter((o) => o.sessionId === sessionId.value)
+    saveSessionOps(sessionId.value, own)
   }
 
-  function snapshot(): HistorySnapshot {
-    return {
-      cells: JSON.parse(JSON.stringify(cells.value)) as CellMap,
-      active: { ...active.value },
-      selection: { start: { ...selection.value.start }, end: { ...selection.value.end } },
+  function applyRevisionOp(op: CellOp, opts: { persist: boolean; broadcast: boolean }): boolean {
+    const res = applyOp(heads.value, vv.value, op)
+    if (!res.outcome.applied) return false
+    heads.value = res.heads
+    vv.value = res.vv
+    conflicts.value = conflictsOf(heads.value)
+    opLog.value = [...opLog.value, op].sort((a, b) => a.timestamp - b.timestamp || a.opId.localeCompare(b.opId))
+    if (opts.persist) persistSessionOps()
+    if (opts.broadcast) postToChannel({ type: 'op', op })
+    return true
+  }
+
+  function makeLocalOp(cellId: string, raw: string): CellOp {
+    const seq = (vv.value[sessionId.value] ?? 0) + 1
+    return makeOp(sessionId.value, seq, cellId, raw, vv.value)
+  }
+
+  function applyRawToCell(id: string, raw: string) {
+    const record = cells.value[id]
+    cells.value[id] = {
+      ...record,
+      raw,
+      value: raw.startsWith('=') ? null : literalValue(raw),
+      error: undefined,
+      stale: false,
     }
   }
 
-  function recordHistory() {
-    history.value.push(snapshot())
-    if (history.value.length > 80) history.value.shift()
-    future.value = []
+  /** 合并后把某格的展示 raw 同步为当前版本（冲突时取最新一版） */
+  function syncHeadToCell(id: string) {
+    const versions = heads.value.get(id)
+    if (!versions || versions.length === 0) return
+    const display = displayVersion(versions)
+    const record = cells.value[id]
+    cells.value[id] = {
+      ...record,
+      raw: display.raw,
+      value: display.raw.startsWith('=') ? null : literalValue(display.raw),
+      error: undefined,
+      stale: false,
+      conflict: versions.length > 1,
+    }
   }
 
-  function setRaw(row: number, col: number, raw: string, record = true) {
-    if (record) recordHistory()
+  function rebuildAllRaw() {
+    const next = createStarterCells()
+    for (const [id, versions] of heads.value) {
+      const display = displayVersion(versions)
+      next[id] = {
+        raw: display.raw,
+        value: display.raw.startsWith('=') ? null : literalValue(display.raw),
+        error: undefined,
+        stale: false,
+        conflict: versions.length > 1,
+      }
+    }
+    cells.value = next
+  }
+
+  function setRaw(row: number, col: number, raw: string) {
     const id = idFor(row, col)
-    const existing = cells.value[id]
-    if ((existing?.raw ?? '') === raw) return
-    cells.value[id] = { raw, value: raw.startsWith('=') ? null : literalValue(raw) }
-    recalculate(affectedCells([id]))
+    const prevRaw = cells.value[id]?.raw ?? ''
+    if (prevRaw === raw) return
+    const op = makeLocalOp(id, raw)
+    if (!applyRevisionOp(op, { persist: true, broadcast: true })) return
+    applyRawToCell(id, raw)
+    scheduleRecalc([id])
+    undoStack.value.push({ undo: [{ cellId: id, raw: prevRaw }], redo: [{ cellId: id, raw }] })
+    redoStack.value = []
   }
 
   function setManyRaw(start: CellCoord, matrix: string[][]) {
-    recordHistory()
+    const undoEntries: Array<{ cellId: string; raw: string }> = []
+    const redoEntries: Array<{ cellId: string; raw: string }> = []
     const changed: string[] = []
     matrix.forEach((rowValues, rowOffset) => {
       rowValues.forEach((raw, colOffset) => {
@@ -208,11 +239,21 @@ export const useSheetStore = defineStore('sheet', () => {
         const col = start.col + colOffset
         if (row >= rows || col >= cols) return
         const id = idFor(row, col)
-        cells.value[id] = { raw, value: raw.startsWith('=') ? null : literalValue(raw) }
+        const prevRaw = cells.value[id]?.raw ?? ''
+        if (prevRaw === raw) return
+        const op = makeLocalOp(id, raw)
+        if (!applyRevisionOp(op, { persist: true, broadcast: true })) return
+        applyRawToCell(id, raw)
+        undoEntries.push({ cellId: id, raw: prevRaw })
+        redoEntries.push({ cellId: id, raw })
         changed.push(id)
       })
     })
-    recalculate(affectedCells(changed))
+    if (changed.length) {
+      scheduleRecalc(changed)
+      undoStack.value.push({ undo: undoEntries, redo: redoEntries })
+      redoStack.value = []
+    }
   }
 
   function setActive(row: number, col: number, extend = false) {
@@ -259,29 +300,292 @@ export const useSheetStore = defineStore('sheet', () => {
   }
 
   function undo() {
-    const previous = history.value.pop()
-    if (!previous) return
-    future.value.push(snapshot())
-    cells.value = previous.cells
-    active.value = previous.active
-    selection.value = previous.selection
-    recalculate(new Set(Object.keys(cells.value)))
-    status.value = '已撤销上一步编辑'
+    const entry = undoStack.value.pop()
+    if (!entry) return
+    const changed: string[] = []
+    for (const { cellId, raw } of entry.undo) {
+      const op = makeLocalOp(cellId, raw)
+      if (applyRevisionOp(op, { persist: true, broadcast: true })) {
+        applyRawToCell(cellId, raw)
+        changed.push(cellId)
+      }
+    }
+    if (changed.length) {
+      redoStack.value.push(entry)
+      scheduleRecalc(changed)
+      status.value = '已撤销（作为新操作追加到修订记录）'
+    }
   }
 
   function redo() {
-    const next = future.value.pop()
-    if (!next) return
-    history.value.push(snapshot())
-    cells.value = next.cells
-    active.value = next.active
-    selection.value = next.selection
-    recalculate(new Set(Object.keys(cells.value)))
-    status.value = '已恢复编辑'
+    const entry = redoStack.value.pop()
+    if (!entry) return
+    const changed: string[] = []
+    for (const { cellId, raw } of entry.redo) {
+      const op = makeLocalOp(cellId, raw)
+      if (applyRevisionOp(op, { persist: true, broadcast: true })) {
+        applyRawToCell(cellId, raw)
+        changed.push(cellId)
+      }
+    }
+    if (changed.length) {
+      undoStack.value.push(entry)
+      scheduleRecalc(changed)
+      status.value = '已重做（作为新操作追加到修订记录）'
+    }
+  }
+
+  /** 同格两版待选：采用某一版（追加一条本地操作背书，跨标签页同步） */
+  function selectVersion(cellId: string, opId: string) {
+    const versions = heads.value.get(cellId) ?? []
+    const chosen = versions.find((v) => v.opId === opId)
+    if (!chosen) return
+    const op = makeLocalOp(cellId, chosen.raw)
+    if (applyRevisionOp(op, { persist: true, broadcast: true })) {
+      applyRawToCell(cellId, chosen.raw)
+      scheduleRecalc([cellId])
+      status.value = `已采用 ${chosen.sessionId} 版（操作 ${op.opId}）`
+    }
   }
 
   function isSelected(row: number, col: number) {
     return rangeContains(selection.value, row, col)
+  }
+
+  function getCellFlags(id: string) {
+    return {
+      conflict: conflicts.value.some((c) => c.cellId === id),
+      stale: cells.value[id]?.stale ?? false,
+      dirty: dirtyCells.value.has(id),
+    }
+  }
+
+  // ---- 公式重算 ----
+
+  function scheduleRecalc(changedIds: string[] | Set<string>) {
+    const affected = affectedCells([...changedIds])
+    const dirty = new Set(dirtyCells.value)
+    affected.forEach((id) => dirty.add(id))
+    dirtyCells.value = dirty
+    recalcGeneration.value += 1
+    void runRecalcLoop()
+  }
+
+  function delay(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms))
+  }
+
+  function evaluateBatch(ids: Set<string>): { results: Map<string, CellValue>; failures: Map<string, string> } {
+    const results = new Map<string, CellValue>()
+    const failures = new Map<string, string>()
+    const resolved = new Map<string, CellValue>()
+    const failedCycles = new Set<string>()
+
+    const resolve = (id: string, stack: string[]): CellValue => {
+      if (resolved.has(id)) return resolved.get(id) ?? null
+      if (stack.includes(id)) {
+        stack.forEach((item) => failedCycles.add(item))
+        throw new FormulaError('#CYCLE!')
+      }
+      const record = cells.value[id]
+      if (!record) return null
+      if (!record.raw.startsWith('=')) {
+        const value = literalValue(record.raw)
+        resolved.set(id, value)
+        return value
+      }
+      const ast = parseFormula(record.raw)
+      const nextStack = [...stack, id]
+      const value = evaluateAst(
+        ast,
+        (reference) => resolve(reference, nextStack),
+        (range) => {
+          const [start, end] = range.split(':')
+          const idsInRange: string[] = []
+          const startMatch = /^([A-Z]+)(\d+)$/i.exec(start)
+          const endMatch = /^([A-Z]+)(\d+)$/i.exec(end)
+          if (startMatch && endMatch) {
+            const startCol = columnIndex(startMatch[1])
+            const endCol = columnIndex(endMatch[1])
+            for (let row = Number(startMatch[2]) - 1; row <= Number(endMatch[2]) - 1; row += 1) {
+              for (let col = startCol; col <= endCol; col += 1) idsInRange.push(cellId(row, col))
+            }
+          }
+          return idsInRange.map((cell) => resolve(cell, nextStack))
+        },
+      ) as CellValue
+      resolved.set(id, value)
+      return value
+    }
+
+    ids.forEach((id) => {
+      try {
+        results.set(id, resolve(id, []))
+      } catch (error) {
+        const code = error instanceof FormulaError ? error.code : '#ERROR!'
+        failures.set(id, failedCycles.has(id) ? '#CYCLE!' : code)
+      }
+    })
+    return { results, failures }
+  }
+
+  function commitResults(ids: Set<string>, results: Map<string, CellValue>, failures: Map<string, string>) {
+    const next = { ...cells.value }
+    const dirty = new Set(dirtyCells.value)
+    for (const id of ids) {
+      const record = next[id]
+      if (!record) {
+        dirty.delete(id)
+        continue
+      }
+      if (failures.has(id)) {
+        const code = failures.get(id)!
+        const good = lastGood.value.get(id)
+        if (good !== undefined) {
+          // 重试后仍失败：保留上次有效值
+          next[id] = { ...record, value: good, error: code, stale: true }
+        } else {
+          next[id] = { ...record, value: null, error: code, stale: true }
+        }
+      } else {
+        const value = results.get(id) ?? null
+        next[id] = { ...record, value, error: undefined, stale: false }
+        lastGood.value.set(id, value)
+      }
+      dirty.delete(id)
+    }
+    cells.value = next
+    dirtyCells.value = dirty
+    lastRecalculated.value = [...ids]
+    if (failures.size) {
+      recalcState.value = 'failed'
+      status.value = `重算 ${failures.size} 处失败，已保留上次有效值`
+    }
+  }
+
+  async function runRecalcLoop() {
+    if (recalcLoopRunning) return
+    recalcLoopRunning = true
+    while (true) {
+      const ids = new Set(dirtyCells.value)
+      if (ids.size === 0) break
+      const gen = recalcGeneration.value
+      recalcState.value = 'running'
+      status.value = `重算中（第 ${gen} 批）…`
+      // 模拟公式链耗时：受影响单元格越多，链越长
+      await delay(Math.min(30 + ids.size * 10, 450))
+      if (gen !== recalcGeneration.value) continue // 在算旧批次作废
+      let evaluated = evaluateBatch(ids)
+      let retryCount = 0
+      while (evaluated.failures.size > 0 && retryCount < 2) {
+        retryCount += 1
+        recalcState.value = 'retrying'
+        status.value = `重算失败，第 ${retryCount} 次重试…`
+        await delay(80 * retryCount)
+        if (gen !== recalcGeneration.value) break
+        evaluated = evaluateBatch(ids)
+      }
+      if (gen !== recalcGeneration.value) continue
+      commitResults(ids, evaluated.results, evaluated.failures)
+    }
+    recalcLoopRunning = false
+    recalcState.value = 'idle'
+    if (recalcGeneration.value > 0) status.value = '重算完成，受影响公式已更新'
+  }
+
+  // ---- 跨标签页同步 ----
+
+  let channel: BroadcastChannel | null = null
+  try {
+    channel = new BroadcastChannel(CHANNEL_NAME)
+    channel.onmessage = (event) => {
+      const data = event.data as { type?: string; op?: CellOp } | undefined
+      if (data?.type === 'op' && data.op) ingestRemoteOp(data.op)
+    }
+  } catch {
+    channel = null
+  }
+
+  function postToChannel(message: { type: string; op?: CellOp; sessionId?: string; vv?: VersionVector }) {
+    try {
+      channel?.postMessage(message)
+    } catch {
+      /* 通道不可用时忽略 */
+    }
+  }
+
+  function ingestRemoteOp(op: CellOp) {
+    if (op.sessionId === sessionId.value) return
+    const res = applyOp(heads.value, vv.value, op)
+    if (!res.outcome.applied) return
+    heads.value = res.heads
+    vv.value = res.vv
+    conflicts.value = conflictsOf(heads.value)
+    opLog.value = [...opLog.value, op].sort((a, b) => a.timestamp - b.timestamp || a.opId.localeCompare(b.opId))
+    syncHeadToCell(op.cellId)
+    scheduleRecalc([op.cellId])
+  }
+
+  /** storage 事件兜底（BroadcastChannel 不可用时仍可合并其他标签页的写入） */
+  function remergeFromStorage() {
+    const allOps = loadAllSessionOps()
+    const { heads: h, vv: v } = replayOps(allOps)
+    if (vvEqual(v, vv.value)) {
+      opLog.value = allOps
+      return
+    }
+    heads.value = h
+    vv.value = v
+    conflicts.value = conflictsOf(h)
+    opLog.value = allOps
+    const next = { ...cells.value }
+    for (const [id, versions] of h) {
+      const display = displayVersion(versions)
+      const record = next[id]
+      if (record?.raw !== display.raw || versions.length > 1) {
+        next[id] = {
+          ...record,
+          raw: display.raw,
+          value: display.raw.startsWith('=') ? null : literalValue(display.raw),
+          error: undefined,
+          stale: false,
+          conflict: versions.length > 1,
+        }
+      }
+    }
+    cells.value = next
+    persistSessionOps()
+    scheduleRecalc(allOps.map((o) => o.cellId))
+  }
+
+  window.addEventListener('storage', (event) => {
+    if (event.key?.startsWith('gridformula-session:')) remergeFromStorage()
+  })
+
+  // ---- 恢复 / 回放 ----
+
+  /** 恢复后从最后完整操作继续；重复回放不追加（opId 去重，幂等） */
+  function replayAll() {
+    const allOps = loadAllSessionOps()
+    const before = opLog.value.length
+    const { heads: h, vv: v } = replayOps(allOps)
+    heads.value = h
+    vv.value = v
+    conflicts.value = conflictsOf(h)
+    opLog.value = allOps
+    rebuildAllRaw()
+    persistSessionOps()
+    scheduleRecalc(allOps.map((o) => o.cellId))
+    const after = opLog.value.length
+    status.value = `回放完成：${after} 条操作（回放前 ${before} 条）；重复回放不追加`
+  }
+
+  function openSessionTab() {
+    window.open(window.location.href, '_blank')
+  }
+
+  function toggleRevisionPanel() {
+    revisionPanelOpen.value = !revisionPanelOpen.value
   }
 
   function exportCsv() {
@@ -296,24 +600,55 @@ export const useSheetStore = defineStore('sheet', () => {
       }
       if (hasData || row < 15) lines.push(values.join(','))
     }
-    const blob = new Blob([`\uFEFF${lines.join('\n')}`], { type: 'text/csv;charset=utf-8' })
+    const blob = new Blob([`﻿${lines.join('\n')}`], { type: 'text/csv;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = url
-    anchor.download = '季度销售公式表.csv'
+    anchor.download = '季度销售公式表（合并当前版本）.csv'
     anchor.click()
     URL.revokeObjectURL(url)
-    status.value = 'CSV 已导出'
+    status.value = 'CSV 已导出（来自合并后的当前版本）'
   }
 
   function reset() {
-    recordHistory()
+    clearAllSessionOps()
+    heads.value = new Map()
+    vv.value = {}
+    conflicts.value = []
+    opLog.value = []
+    undoStack.value = []
+    redoStack.value = []
     cells.value = createStarterCells()
-    recalculate(new Set(Object.keys(cells.value)))
-    status.value = '已恢复示例工作簿'
+    lastGood.value = new Map()
+    dirtyCells.value = new Set()
+    baseVV.value = {}
+    persistSessionOps()
+    postToChannel({ type: 'reset' })
+    scheduleRecalc(new Set(Object.keys(cells.value)))
+    status.value = '已重置工作簿与修订记录'
   }
 
-  recalculate(new Set(Object.keys(cells.value)))
+  function init() {
+    const allOps = loadAllSessionOps()
+    const { heads: h, vv: v } = replayOps(allOps)
+    heads.value = h
+    vv.value = v
+    conflicts.value = conflictsOf(h)
+    opLog.value = allOps
+    rebuildAllRaw()
+    let sid = sessionStorage.getItem('gridformula-session')
+    if (!sid) {
+      sid = createSessionId()
+      sessionStorage.setItem('gridformula-session', sid)
+    }
+    sessionId.value = sid
+    baseVV.value = cloneVV(v)
+    persistSessionOps()
+    postToChannel({ type: 'hello', sessionId: sid, vv: v })
+    scheduleRecalc(allOps.map((o) => o.cellId))
+  }
+
+  init()
 
   return {
     rows,
@@ -329,9 +664,22 @@ export const useSheetStore = defineStore('sheet', () => {
     canUndo,
     canRedo,
     status,
+    // 修订
+    sessionId,
+    baseVV,
+    vv,
+    heads,
+    conflicts,
+    opLog,
+    localSeq,
+    recalcGeneration,
+    recalcState,
+    dirtyCount,
+    revisionPanelOpen,
     idFor,
     getRaw,
     getRecord,
+    getCellFlags,
     setRaw,
     setManyRaw,
     setActive,
@@ -342,8 +690,12 @@ export const useSheetStore = defineStore('sheet', () => {
     clearSelection,
     undo,
     redo,
+    selectVersion,
     isSelected,
     exportCsv,
     reset,
+    replayAll,
+    openSessionTab,
+    toggleRevisionPanel,
   }
 })
